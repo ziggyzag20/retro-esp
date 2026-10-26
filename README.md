@@ -29,3 +29,9 @@ The Retro-ESP is a handheld touchscreen retro game device that you can use anywh
 To install any games, you can simply use the game store function to download any games over Wi-Fi to the SD card. Playing them is as simple as opening them.
 
 Should any issues arise, you should report it as a bug on the branch for that game. Please do not contact me for support if I did not make the game.
+
+# Making your own games
+Making your own games is unfortunately not as simple as using python or the IDE.
+
+To make your own games, you will need to use the API found in the project. Follow the examples for help if needed.
+When making a game, you will need to upload it to a repo and set that repo in your settings. However, you can upload multiple games into one repo, as this essentially acts as a store. Use the official repo as a template and review it thoroughly.
