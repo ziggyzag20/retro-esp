@@ -3,7 +3,7 @@
   A landscape LVGL arcade console for the Freenove FNK0104N.
 
   Built-in games are native firmware. The public store also loads bounded,
-  validated Script API 2 cartridges; downloaded files never contain executable code.
+  validated Script API 2/3 cartridges; downloaded files never contain executable code.
 */
 
 #include <Arduino.h>
@@ -18,6 +18,11 @@
 #include <HTTPClient.h>
 #include <Preferences.h>
 #include <strings.h>
+#include <Wire.h>
+#include <ESP_I2S.h>
+#include <Audio.h>
+#include <TJpg_Decoder.h>
+#include <esp_heap_caps.h>
 
 static const uint16_t SCREEN_W = 480;
 static const uint16_t SCREEN_H = 320;
@@ -27,18 +32,31 @@ static const uint16_t SD_D0_PIN = 6;
 static const uint16_t SD_D1_PIN = 7;
 static const uint16_t SD_D2_PIN = 2;
 static const uint16_t SD_D3_PIN = 3;
-static const char *STORE_ROOT_DEFAULT =
-  "https://raw.githubusercontent.com/owner/PixelDeck-Store/main/";
+static const char *STORE_ROOT_DEFAULT = "https://raw.githubusercontent.com/owner/PixelDeck-Store/main/";
 static const char *GAMES_DIR = "/ARCADE/GAMES";
 static const uint8_t MAX_GAMES = 32;
 static const uint8_t MAX_STORE_ITEMS = 24;
-static const size_t MAX_CART_BYTES = 24576;
-static const uint16_t MAX_SCRIPT_INSTRUCTIONS = 768;
-static const uint16_t MAX_SCRIPT_EVENT_STEPS = 2048;
-static const uint8_t MAX_SCRIPT_REPEAT = 64;
-static const uint8_t MAX_SCRIPT_ENTITIES = 96;
-static const uint8_t MAX_SCRIPT_VARIABLES = 64;
-static const uint8_t MAX_SCRIPT_LABELS = 8;
+static const size_t MAX_CART_BYTES = 98304;
+static const uint16_t MAX_SCRIPT_INSTRUCTIONS = 4096;
+static const uint16_t MAX_SCRIPT_EVENT_STEPS = 8192;
+static const uint8_t MAX_SCRIPT_REPEAT = 128;
+static const uint8_t MAX_SCRIPT_NESTING = 16;
+static const uint8_t MAX_SCRIPT_ENTITIES = 160;
+static const uint8_t MAX_SCRIPT_VARIABLES = 128;
+static const uint8_t MAX_SCRIPT_LABELS = 16;
+static const uint8_t MAX_GAME_ASSETS = 8;
+static const size_t MAX_ASSET_BYTES = 512 * 1024;
+static const size_t MAX_TOTAL_ASSET_BYTES = 2 * 1024 * 1024;
+static const uint32_t MAX_BITMAP_PIXELS = 65536;
+static const uint8_t MAX_RENDER_ENTITIES = 160;
+static const uint8_t I2S_MCLK_PIN = 17;
+static const uint8_t I2S_BCLK_PIN = 18;
+static const uint8_t I2S_DIN_PIN = 16;
+static const uint8_t I2S_DOUT_PIN = 15;
+static const uint8_t I2S_WS_PIN = 21;
+static const uint8_t AUDIO_AMP_ENABLE_PIN = 1;
+static const uint8_t AUDIO_I2C_SDA_PIN = 38;
+static const uint8_t AUDIO_I2C_SCL_PIN = 39;
 
 // The local LVGL configuration is RGB565 and already enables Montserrat 14/20.
 static lv_color_t displayBuffer[SCREEN_W * 20];
@@ -58,6 +76,11 @@ static String savedStoreRoot;
 enum GameType : uint8_t { GAME_NONE, GAME_SNAKE, GAME_PONG, GAME_BREAKOUT, GAME_INVADERS, GAME_SCRIPT };
 enum ScreenMode : uint8_t { SCREEN_HOME, SCREEN_GAMES, SCREEN_STORE, SCREEN_SETTINGS, SCREEN_HELP, SCREEN_PLAY };
 
+struct GameAssetDef {
+  char name[16];
+  char filename[40];
+};
+
 struct GameCard {
   char id[24];
   char title[40];
@@ -67,6 +90,8 @@ struct GameCard {
   uint16_t tickMs;
   uint32_t accent;
   bool builtIn;
+  uint8_t assetCount;
+  GameAssetDef assets[MAX_GAME_ASSETS];
 };
 
 enum ScriptEvent : uint8_t {
@@ -84,11 +109,14 @@ enum ScriptOp : uint8_t {
   SCRIPT_OP_COLLIDE, SCRIPT_OP_GETX, SCRIPT_OP_GETY, SCRIPT_OP_GETVX,
   SCRIPT_OP_GETVY, SCRIPT_OP_EXISTS, SCRIPT_OP_HIDE, SCRIPT_OP_SHOW,
   SCRIPT_OP_REMOVE, SCRIPT_OP_TWEEN, SCRIPT_OP_LABEL, SCRIPT_OP_TEXT,
-  SCRIPT_OP_CLEARLABEL, SCRIPT_OP_OVER, SCRIPT_OP_WIN
+  SCRIPT_OP_CLEARLABEL, SCRIPT_OP_IMAGE, SCRIPT_OP_MUSIC, SCRIPT_OP_SFX,
+  SCRIPT_OP_AUDIO_STOP, SCRIPT_OP_AUDIO_VOLUME, SCRIPT_OP_CIRCLE,
+  SCRIPT_OP_BACKGROUND, SCRIPT_OP_ALPHA,
+  SCRIPT_OP_OVER, SCRIPT_OP_WIN
 };
 
 struct ScriptInstruction {
-  uint16_t sourceOffset;
+  uint32_t sourceOffset;
   uint16_t jump;
   uint8_t event;
   uint8_t op;
@@ -100,12 +128,23 @@ struct ScriptEntity {
   int16_t w, h;
   uint32_t tint;
   uint8_t radius;
-  bool active, visible, wrap, tweening;
+  uint8_t bitmapIndex;
+  uint8_t opacity;
+  uint16_t zoom;
+  bool active, visible, wrap, tweening, isImage, imageObject;
   float fromX, fromY, targetX, targetY;
   uint32_t tweenStarted, tweenDuration;
 };
 
 struct ScriptVariable { char name[16]; int32_t value; bool used; };
+
+struct BitmapAsset {
+  char name[16];
+  lv_img_dsc_t image;
+  lv_color_t *pixels;
+  uint16_t width, height;
+  bool loaded;
+};
 
 struct StoreItem {
   GameCard game;
@@ -119,13 +158,24 @@ static uint8_t storeCount = 0;
 static char libraryNotice[96] = {};
 static ScreenMode screenMode = SCREEN_HOME;
 static GameCard activeGame;
-static char scriptProgram[MAX_CART_BYTES + 1];
+static char *scriptProgram = nullptr;
+static size_t scriptProgramCapacity = 0;
 static ScriptInstruction scriptCode[MAX_SCRIPT_INSTRUCTIONS];
 static uint16_t scriptCodeCount = 0;
-static uint16_t scriptCompileErrorLine = 0;
+static uint32_t scriptCompileErrorLine = 0;
 static ScriptEntity scriptEntities[MAX_SCRIPT_ENTITIES];
 static ScriptVariable scriptVariables[MAX_SCRIPT_VARIABLES];
 static lv_obj_t *scriptLabels[MAX_SCRIPT_LABELS];
+static BitmapAsset bitmapAssets[MAX_GAME_ASSETS];
+static uint8_t bitmapAssetCount = 0;
+static Audio audio;
+static I2SClass es8311_i2s;
+static bool audioReady = false;
+static uint8_t consoleVolume = 10;
+static char backgroundAudioName[16] = {};
+static uint8_t backgroundAudioVolume = 10;
+static bool effectAudioActive = false;
+static bool backgroundAudioLoops = false;
 static uint8_t scriptLevel = 1;
 static uint32_t scriptStartedAt = 0;
 static int16_t pointerX = 0, pointerY = 0;
@@ -144,7 +194,7 @@ static lv_obj_t *ssidField = nullptr;
 static lv_obj_t *passwordField = nullptr;
 static lv_obj_t *storeField = nullptr;
 static lv_obj_t *settingsStatus = nullptr;
-static lv_obj_t *entities[128];
+static lv_obj_t *entities[MAX_RENDER_ENTITIES];
 
 static bool controls[4] = {false, false, false, false}; // left, up, down, right
 static bool actionA = false, actionB = false;
@@ -198,6 +248,11 @@ static void runScriptEvent(ScriptEvent event);
 static void updateScriptTweens();
 static void resetScriptRuntime();
 static bool parseCart(const String &payload, GameCard &card);
+static bool beginAudio();
+static void stopGameAudio();
+static void playGameAudio(const char *assetName, bool loopFile, uint8_t volume, bool effect = false);
+static void freeBitmapAssets();
+static void loadGameBitmapAssets();
 
 static lv_color_t color(uint32_t hex) { return lv_color_hex(hex); }
 
@@ -210,6 +265,287 @@ static void copyLiteral(char *out, size_t capacity, const char *value) {
   if (capacity == 0) return;
   strncpy(out, value, capacity - 1);
   out[capacity - 1] = '\0';
+}
+
+static bool es8311WriteRegister(uint8_t reg, uint8_t value) {
+  Wire.beginTransmission(0x18);
+  Wire.write(reg);
+  Wire.write(value);
+  return Wire.endTransmission() == 0;
+}
+
+// FNK0104N uses an ES8311 codec. This small DAC-only setup follows Freenove's
+// published 44.1 kHz, 16-bit I2S configuration while keeping the driver local.
+static bool configureEs8311() {
+  static const uint8_t setup[][2] = {
+    {0x00, 0x1F}, {0x00, 0x00}, {0x00, 0x80},
+    {0x01, 0x3F}, {0x02, 0x00}, {0x03, 0x10}, {0x04, 0x10},
+    {0x05, 0x00}, {0x06, 0x03}, {0x07, 0x00}, {0x08, 0xFF},
+    {0x09, 0x0C}, {0x0A, 0x0C}, {0x0D, 0x01}, {0x0E, 0x02},
+    {0x12, 0x00}, {0x13, 0x10}, {0x1C, 0x6A}, {0x32, 0xD8}, {0x37, 0x08}
+  };
+  for (size_t i = 0; i < sizeof(setup) / sizeof(setup[0]); ++i) {
+    if (!es8311WriteRegister(setup[i][0], setup[i][1])) return false;
+    if (i == 0) delay(20);
+  }
+  return true;
+}
+
+static bool beginAudio() {
+  pinMode(AUDIO_AMP_ENABLE_PIN, OUTPUT);
+  digitalWrite(AUDIO_AMP_ENABLE_PIN, LOW);
+  Wire.begin(AUDIO_I2C_SDA_PIN, AUDIO_I2C_SCL_PIN, 400000);
+  es8311_i2s.setPins(I2S_BCLK_PIN, I2S_WS_PIN, I2S_DOUT_PIN, I2S_DIN_PIN, I2S_MCLK_PIN);
+  if (!es8311_i2s.begin(I2S_MODE_STD, 44100, I2S_DATA_BIT_WIDTH_16BIT,
+                       I2S_SLOT_MODE_STEREO, I2S_STD_SLOT_LEFT)) {
+    Serial.println("[AUDIO] FNK0104N I2S initialization failed.");
+    return false;
+  }
+  if (!configureEs8311()) {
+    Serial.println("[AUDIO] ES8311 did not acknowledge its setup registers.");
+    return false;
+  }
+  audio.setPinout(I2S_BCLK_PIN, I2S_WS_PIN, I2S_DOUT_PIN, I2S_MCLK_PIN);
+  audio.setVolume(consoleVolume);
+  Serial.println("[AUDIO] FNK0104N speaker path ready.");
+  return true;
+}
+
+static void stopGameAudio() {
+  if (audioReady && audio.isRunning()) audio.stopSong();
+  backgroundAudioName[0] = '\0';
+  effectAudioActive = false;
+  backgroundAudioLoops = false;
+}
+
+static const GameAssetDef *findGameAsset(const char *name) {
+  if (!name) return nullptr;
+  for (uint8_t i = 0; i < activeGame.assetCount; ++i) {
+    if (!strcasecmp(activeGame.assets[i].name, name)) return &activeGame.assets[i];
+  }
+  return nullptr;
+}
+
+static bool isImageAsset(const char *filename) {
+  String name(filename ? filename : "");
+  name.toLowerCase();
+  return name.endsWith(".jpg") || name.endsWith(".jpeg") || name.endsWith(".bmp");
+}
+
+static bool isAudioAsset(const char *filename) {
+  String name(filename ? filename : "");
+  name.toLowerCase();
+  return name.endsWith(".mp3") || name.endsWith(".wav") || name.endsWith(".aac") ||
+    name.endsWith(".flac") || name.endsWith(".m4a") || name.endsWith(".ogg") ||
+    name.endsWith(".oga") || name.endsWith(".opus");
+}
+
+static bool validAssetName(const String &name) {
+  if (name.length() == 0 || name.length() >= 16) return false;
+  for (size_t i = 0; i < name.length(); ++i) {
+    const char c = name[i];
+    if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+          (c >= '0' && c <= '9') || c == '-' || c == '_')) return false;
+  }
+  return true;
+}
+
+static bool validAssetFilename(const String &filename) {
+  if (filename.length() == 0 || filename.length() >= 40 ||
+      filename.indexOf('/') >= 0 || filename.indexOf('\\') >= 0 ||
+      filename.indexOf("..") >= 0) return false;
+  for (size_t i = 0; i < filename.length(); ++i) {
+    const char c = filename[i];
+    if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+          (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.')) return false;
+  }
+  const bool image = isImageAsset(filename.c_str());
+  const bool audioFile = isAudioAsset(filename.c_str());
+  if (!image && !audioFile) return false;
+  // ESP32-audioI2S 3.0.13 selects its decoder by a case-sensitive extension.
+  if (audioFile) {
+    String extension = filename.substring(filename.lastIndexOf('.'));
+    String lowercaseExtension = extension;
+    lowercaseExtension.toLowerCase();
+    if (extension != lowercaseExtension) return false;
+  }
+  return true;
+}
+
+struct JpegDecodeTarget { lv_color_t *pixels; uint16_t width, height; };
+static JpegDecodeTarget *jpegTarget = nullptr;
+
+static bool jpegToLvglImage(int16_t x, int16_t y, uint16_t width, uint16_t height, uint16_t *data) {
+  if (!jpegTarget || !jpegTarget->pixels || !data) return false;
+  for (uint16_t row = 0; row < height; ++row) {
+    const uint16_t py = (uint16_t)max(0, (int)y + row);
+    if (py >= jpegTarget->height) continue;
+    for (uint16_t col = 0; col < width; ++col) {
+      const uint16_t px = (uint16_t)max(0, (int)x + col);
+      if (px >= jpegTarget->width) continue;
+      const uint16_t rgb = data[(size_t)row * width + col];
+      const uint8_t red = (uint8_t)(((rgb >> 11) & 0x1F) * 255 / 31);
+      const uint8_t green = (uint8_t)(((rgb >> 5) & 0x3F) * 255 / 63);
+      const uint8_t blue = (uint8_t)((rgb & 0x1F) * 255 / 31);
+      jpegTarget->pixels[(size_t)py * jpegTarget->width + px] = lv_color_make(red, green, blue);
+    }
+  }
+  return true;
+}
+
+static uint16_t readLittle16(const uint8_t *bytes) {
+  return (uint16_t)bytes[0] | ((uint16_t)bytes[1] << 8);
+}
+
+static uint32_t readLittle32(const uint8_t *bytes) {
+  return (uint32_t)bytes[0] | ((uint32_t)bytes[1] << 8) |
+    ((uint32_t)bytes[2] << 16) | ((uint32_t)bytes[3] << 24);
+}
+
+static bool decodeBmpAsset(const String &path, BitmapAsset &bitmap) {
+  File file = SD_MMC.open(path, FILE_READ);
+  if (!file || file.isDirectory() || file.size() < 54) { if (file) file.close(); return false; }
+  uint8_t header[54];
+  if (file.read(header, sizeof(header)) != sizeof(header) || header[0] != 'B' || header[1] != 'M') {
+    file.close();
+    return false;
+  }
+  const uint32_t dataOffset = readLittle32(header + 10);
+  const int32_t signedWidth = (int32_t)readLittle32(header + 18);
+  const int32_t signedHeight = (int32_t)readLittle32(header + 22);
+  const uint16_t bitsPerPixel = readLittle16(header + 28);
+  const uint32_t compression = readLittle32(header + 30);
+  if (signedWidth <= 0 || signedHeight == 0 || signedHeight == INT32_MIN ||
+      signedWidth > 2047 || abs(signedHeight) > 2047 || readLittle16(header + 26) != 1 ||
+      bitsPerPixel != 24 || compression != 0) {
+    file.close();
+    return false;
+  }
+  const uint16_t sourceWidth = (uint16_t)signedWidth;
+  const uint16_t sourceHeight = (uint16_t)abs(signedHeight);
+  uint8_t scale = 1;
+  while (scale < 8 && ((uint32_t)((sourceWidth + scale - 1) / scale) *
+                       ((sourceHeight + scale - 1) / scale) > MAX_BITMAP_PIXELS ||
+                       (sourceWidth + scale - 1) / scale > 512 ||
+                       (sourceHeight + scale - 1) / scale > 512)) scale *= 2;
+  bitmap.width = (uint16_t)((sourceWidth + scale - 1) / scale);
+  bitmap.height = (uint16_t)((sourceHeight + scale - 1) / scale);
+  if ((uint32_t)bitmap.width * bitmap.height > MAX_BITMAP_PIXELS) { file.close(); return false; }
+  const size_t bytes = (size_t)bitmap.width * bitmap.height * sizeof(lv_color_t);
+  bitmap.pixels = (lv_color_t *)heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!bitmap.pixels) bitmap.pixels = (lv_color_t *)malloc(bytes);
+  if (!bitmap.pixels) { file.close(); return false; }
+  const uint32_t rowBytes = ((uint32_t)sourceWidth * 3 + 3) & ~3UL;
+  uint8_t row[6144];
+  bool ok = true;
+  for (uint16_t outY = 0; outY < bitmap.height && ok; ++outY) {
+    const uint16_t sourceY = (uint16_t)(outY * scale);
+    const uint16_t fileY = signedHeight > 0 ? (sourceHeight - 1 - sourceY) : sourceY;
+    if (!file.seek(dataOffset + (uint32_t)fileY * rowBytes) || file.read(row, rowBytes) != rowBytes) {
+      ok = false;
+      break;
+    }
+    for (uint16_t outX = 0; outX < bitmap.width; ++outX) {
+      const uint16_t sourceX = (uint16_t)(outX * scale);
+      const uint8_t *pixel = row + (size_t)sourceX * 3;
+      bitmap.pixels[(size_t)outY * bitmap.width + outX] = lv_color_make(pixel[2], pixel[1], pixel[0]);
+    }
+  }
+  file.close();
+  if (!ok) { free(bitmap.pixels); bitmap.pixels = nullptr; return false; }
+  bitmap.image.header.cf = LV_IMG_CF_TRUE_COLOR;
+  bitmap.image.header.always_zero = 0;
+  bitmap.image.header.reserved = 0;
+  bitmap.image.header.w = bitmap.width;
+  bitmap.image.header.h = bitmap.height;
+  bitmap.image.data_size = (uint32_t)bytes;
+  bitmap.image.data = (const uint8_t *)bitmap.pixels;
+  bitmap.loaded = true;
+  return true;
+}
+
+static void freeBitmapAssets() {
+  for (uint8_t i = 0; i < MAX_GAME_ASSETS; ++i) {
+    if (bitmapAssets[i].pixels) free(bitmapAssets[i].pixels);
+    memset(&bitmapAssets[i], 0, sizeof(bitmapAssets[i]));
+  }
+  bitmapAssetCount = 0;
+  jpegTarget = nullptr;
+}
+
+static void loadGameBitmapAssets() {
+  freeBitmapAssets();
+  if (!sdReady || activeGame.type != GAME_SCRIPT) return;
+  bitmapAssetCount = activeGame.assetCount;
+  TJpgDec.setSwapBytes(false);
+  TJpgDec.setCallback(jpegToLvglImage);
+  for (uint8_t i = 0; i < activeGame.assetCount; ++i) {
+    const GameAssetDef &definition = activeGame.assets[i];
+    if (!isImageAsset(definition.filename)) continue;
+    BitmapAsset &bitmap = bitmapAssets[i];
+    copyLiteral(bitmap.name, sizeof(bitmap.name), definition.name);
+    const String path = String(GAMES_DIR) + "/" + activeGame.id + "/assets/" + definition.filename;
+    String imageFilename(definition.filename);
+    imageFilename.toLowerCase();
+    if (imageFilename.endsWith(".bmp")) {
+      if (!decodeBmpAsset(path, bitmap)) Serial.printf("[BITMAP] Could not decode %s\n", path.c_str());
+      continue;
+    }
+    uint16_t sourceWidth = 0, sourceHeight = 0;
+    if (TJpgDec.getFsJpgSize(&sourceWidth, &sourceHeight, path, SD_MMC) != JDR_OK ||
+        sourceWidth == 0 || sourceHeight == 0 || sourceWidth > 2048 || sourceHeight > 2048) continue;
+    uint8_t scale = 1;
+    while (scale < 8 && ((uint32_t)(sourceWidth / scale) * (sourceHeight / scale) > MAX_BITMAP_PIXELS ||
+                         sourceWidth / scale > 512 || sourceHeight / scale > 512)) scale *= 2;
+    bitmap.width = max((uint16_t)1, (uint16_t)((sourceWidth + scale - 1) / scale));
+    bitmap.height = max((uint16_t)1, (uint16_t)((sourceHeight + scale - 1) / scale));
+    if ((uint32_t)bitmap.width * bitmap.height > MAX_BITMAP_PIXELS) continue;
+    bitmap.pixels = (lv_color_t *)heap_caps_malloc((size_t)bitmap.width * bitmap.height * sizeof(lv_color_t),
+                                                   MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!bitmap.pixels) bitmap.pixels = (lv_color_t *)malloc((size_t)bitmap.width * bitmap.height * sizeof(lv_color_t));
+    if (!bitmap.pixels) continue;
+    memset(bitmap.pixels, 0, (size_t)bitmap.width * bitmap.height * sizeof(lv_color_t));
+    JpegDecodeTarget target = {bitmap.pixels, bitmap.width, bitmap.height};
+    jpegTarget = &target;
+    TJpgDec.setJpgScale(scale);
+    const JRESULT result = TJpgDec.drawFsJpg(0, 0, path, SD_MMC);
+    jpegTarget = nullptr;
+    if (result != JDR_OK) {
+      free(bitmap.pixels);
+      memset(&bitmap, 0, sizeof(bitmap));
+      continue;
+    }
+    bitmap.image.header.cf = LV_IMG_CF_TRUE_COLOR;
+    bitmap.image.header.always_zero = 0;
+    bitmap.image.header.reserved = 0;
+    bitmap.image.header.w = bitmap.width;
+    bitmap.image.header.h = bitmap.height;
+    bitmap.image.data_size = (uint32_t)bitmap.width * bitmap.height * sizeof(lv_color_t);
+    bitmap.image.data = (const uint8_t *)bitmap.pixels;
+    bitmap.loaded = true;
+  }
+  TJpgDec.setJpgScale(1);
+}
+
+static void playGameAudio(const char *assetName, bool loopFile, uint8_t volume, bool effect) {
+  if (!audioReady || !sdReady || activeGame.type != GAME_SCRIPT) return;
+  const GameAssetDef *asset = findGameAsset(assetName);
+  if (!asset || !isAudioAsset(asset->filename)) return;
+  const String path = String(GAMES_DIR) + "/" + activeGame.id + "/assets/" + asset->filename;
+  if (!SD_MMC.exists(path)) return;
+  if (effect) effectAudioActive = true;
+  else {
+    copyLiteral(backgroundAudioName, sizeof(backgroundAudioName), assetName);
+    backgroundAudioVolume = volume;
+    backgroundAudioLoops = loopFile;
+    effectAudioActive = false;
+  }
+  audio.stopSong();
+  audio.setVolume(constrain(volume, 0, 21));
+  audio.setFileLoop(loopFile);
+  if (!audio.connecttoFS(SD_MMC, path.c_str())) {
+    Serial.printf("[AUDIO] Could not open %s\n", path.c_str());
+  }
 }
 
 static bool validId(const String &id) {
@@ -357,7 +693,11 @@ static void topBar(const char *title, bool back, bool showStatus = true) {
 
 static void onBack(lv_event_t *event) {
   if (lv_event_get_code(event) != LV_EVENT_CLICKED) return;
-  if (screenMode == SCREEN_PLAY) showGames();
+  if (screenMode == SCREEN_PLAY) {
+    stopGameAudio();
+    showGames();
+    freeBitmapAssets();
+  }
   else showHome();
 }
 
@@ -520,7 +860,7 @@ static void readTouch(lv_indev_drv_t *, lv_indev_data_t *data) {
 }
 
 static lv_obj_t *makeEntity(uint8_t index, int x, int y, int w, int h, uint32_t fill, int radius = 2) {
-  if (index >= 128 || !gameStage) return nullptr;
+  if (index >= MAX_RENDER_ENTITIES || !gameStage) return nullptr;
   if (!entities[index]) {
     entities[index] = lv_obj_create(gameStage);
     lv_obj_set_style_border_width(entities[index], 0, 0);
@@ -537,7 +877,7 @@ static lv_obj_t *makeEntity(uint8_t index, int x, int y, int w, int h, uint32_t 
 }
 
 static void hideEntity(uint8_t index) {
-  if (index < 128 && entities[index]) lv_obj_add_flag(entities[index], LV_OBJ_FLAG_HIDDEN);
+  if (index < MAX_RENDER_ENTITIES && entities[index]) lv_obj_add_flag(entities[index], LV_OBJ_FLAG_HIDDEN);
 }
 
 static void makeStarfield() {
@@ -945,7 +1285,7 @@ static void startGame(const GameCard *game) {
     file.close();
     GameCard loaded = {};
     if (!parseCart(payload, loaded) || loaded.type != GAME_SCRIPT || !sameId(loaded.id, game->id)) {
-      if (scriptCompileErrorLine) snprintf(libraryNotice, sizeof(libraryNotice), "API 2 SCRIPT ERROR ON LINE %u", (unsigned)scriptCompileErrorLine);
+      if (scriptCompileErrorLine) snprintf(libraryNotice, sizeof(libraryNotice), "SCRIPT ERROR ON LINE %u", (unsigned)scriptCompileErrorLine);
       else copyLiteral(libraryNotice, sizeof(libraryNotice), "SCRIPT CART FAILED MANIFEST VALIDATION");
       showGames();
       return;
@@ -957,7 +1297,9 @@ static void startGame(const GameCard *game) {
   }
   screenMode = SCREEN_PLAY;
   clearUiRefs();
+  stopGameAudio();
   lv_obj_clean(lv_scr_act());
+  freeBitmapAssets();
   screenBackground();
   memset(entities, 0, sizeof(entities));
   memset(scriptLabels, 0, sizeof(scriptLabels));
@@ -980,6 +1322,7 @@ static void startGame(const GameCard *game) {
   lv_obj_set_style_radius(gameStage, 9, 0);
   lv_obj_set_style_pad_all(gameStage, 0, 0);
   lv_obj_set_scrollbar_mode(gameStage, LV_SCROLLBAR_MODE_OFF);
+  loadGameBitmapAssets();
   gameHint = makeLabel(gameStage, "", 40, 82, 368, 24, C_AMBER, &lv_font_montserrat_20);
   lv_obj_set_style_text_align(gameHint, LV_TEXT_ALIGN_CENTER, 0);
   lv_obj_add_flag(gameHint, LV_OBJ_FLAG_HIDDEN);
@@ -996,7 +1339,7 @@ static void startGame(const GameCard *game) {
   lastGameTick = millis();
 }
 
-// PixelDeck Script API 2 is an event-driven, bounded instruction VM. Cartridge
+// PixelDeck Script API 2/3 is an event-driven, bounded instruction VM. Cartridge
 // files contain data and commands only; no downloaded C/C++ or machine code runs.
 static char *scriptTrim(char *text) {
   while (*text && (uint8_t)*text <= ' ') ++text;
@@ -1065,14 +1408,22 @@ static ScriptOp scriptOpFromName(const char *name) {
   if (!strcasecmp(name, "label")) return SCRIPT_OP_LABEL;
   if (!strcasecmp(name, "text")) return SCRIPT_OP_TEXT;
   if (!strcasecmp(name, "clearlabel")) return SCRIPT_OP_CLEARLABEL;
+  if (!strcasecmp(name, "image") || !strcasecmp(name, "sprite")) return SCRIPT_OP_IMAGE;
+  if (!strcasecmp(name, "music")) return SCRIPT_OP_MUSIC;
+  if (!strcasecmp(name, "sfx") || !strcasecmp(name, "sound")) return SCRIPT_OP_SFX;
+  if (!strcasecmp(name, "audio_stop")) return SCRIPT_OP_AUDIO_STOP;
+  if (!strcasecmp(name, "audio_volume")) return SCRIPT_OP_AUDIO_VOLUME;
+  if (!strcasecmp(name, "circle")) return SCRIPT_OP_CIRCLE;
+  if (!strcasecmp(name, "background")) return SCRIPT_OP_BACKGROUND;
+  if (!strcasecmp(name, "alpha")) return SCRIPT_OP_ALPHA;
   if (!strcasecmp(name, "over")) return SCRIPT_OP_OVER;
   if (!strcasecmp(name, "win")) return SCRIPT_OP_WIN;
   return SCRIPT_OP_INVALID;
 }
 
-static bool scriptCompileFail(uint16_t line, const char *reason) {
+static bool scriptCompileFail(uint32_t line, const char *reason) {
   scriptCompileErrorLine = line;
-  Serial.printf("[SCRIPT] API 2 rejected at line %u: %s\n", (unsigned)line, reason);
+  Serial.printf("[SCRIPT] API 2/3 rejected at line %u: %s\n", (unsigned)line, reason);
   return false;
 }
 
@@ -1091,6 +1442,14 @@ static bool scriptValidArity(ScriptOp op, uint8_t count) {
     case SCRIPT_OP_EXISTS: return count == 3;
     case SCRIPT_OP_TWEEN: return count == 5;
     case SCRIPT_OP_VELOCITY: return count == 4 || count == 5;
+    case SCRIPT_OP_IMAGE: return count == 6;
+    case SCRIPT_OP_MUSIC: return count == 2 || count == 3;
+    case SCRIPT_OP_SFX: return count == 3;
+    case SCRIPT_OP_AUDIO_STOP: return count == 1;
+    case SCRIPT_OP_AUDIO_VOLUME: return count == 2;
+    case SCRIPT_OP_CIRCLE: return count == 6;
+    case SCRIPT_OP_BACKGROUND: return count == 2;
+    case SCRIPT_OP_ALPHA: return count == 3;
     case SCRIPT_OP_HIDE: case SCRIPT_OP_SHOW: case SCRIPT_OP_REMOVE:
     case SCRIPT_OP_CLEARLABEL: return count == 2;
     case SCRIPT_OP_LABEL: return count >= 7;
@@ -1103,19 +1462,27 @@ static bool scriptValidArity(ScriptOp op, uint8_t count) {
 static bool compileScript(const char *source, size_t length) {
   scriptCompileErrorLine = 0;
   if (!source || length == 0 || length > MAX_CART_BYTES) return scriptCompileFail(0, "invalid or oversized source");
+  if (length + 1 > scriptProgramCapacity) {
+    char *expanded = (char *)heap_caps_malloc(length + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!expanded) expanded = (char *)malloc(length + 1);
+    if (!expanded) return scriptCompileFail(0, "not enough PSRAM for program source");
+    free(scriptProgram);
+    scriptProgram = expanded;
+    scriptProgramCapacity = length + 1;
+  }
   memcpy(scriptProgram, source, length);
   scriptProgram[length] = '\0';
   scriptCodeCount = 0;
   memset(scriptCode, 0, sizeof(scriptCode));
 
   struct BlockFrame { uint16_t instruction; int16_t elseInstruction; uint8_t event; ScriptOp type; };
-  BlockFrame stack[8];
+  BlockFrame stack[MAX_SCRIPT_NESTING];
   uint8_t depth = 0;
   uint8_t event = SCRIPT_NO_EVENT;
   bool sawStart = false, sawUpdate = false;
   char *cursor = scriptProgram;
   const char *limit = scriptProgram + length;
-  uint16_t sourceLine = 0;
+  uint32_t sourceLine = 0;
   while (cursor < limit) {
     ++sourceLine;
     char *lineStart = cursor;
@@ -1124,12 +1491,12 @@ static bool compileScript(const char *source, size_t length) {
     else cursor = scriptProgram + length;
     char *line = scriptTrim(lineStart);
     if (!*line || *line == '#') continue;
-    if (strlen(line) > 220) return scriptCompileFail(sourceLine, "line exceeds 220 characters");
-    char parseLine[224];
+    if (strlen(line) > 384) return scriptCompileFail(sourceLine, "line exceeds 384 characters");
+    char parseLine[388];
     strncpy(parseLine, line, sizeof(parseLine) - 1);
     parseLine[sizeof(parseLine) - 1] = '\0';
-    char *fields[10] = {};
-    const uint8_t count = scriptFields(parseLine, fields, 10);
+    char *fields[16] = {};
+    const uint8_t count = scriptFields(parseLine, fields, 16);
     if (!strcasecmp(fields[0], "on")) {
       if (event != SCRIPT_NO_EVENT || depth != 0 || count != 2) return scriptCompileFail(sourceLine, "malformed event header");
       event = scriptEventFromName(fields[1]);
@@ -1144,15 +1511,15 @@ static bool compileScript(const char *source, size_t length) {
       continue;
     }
     if (event == SCRIPT_NO_EVENT) return scriptCompileFail(sourceLine, "command outside an event");
-    if (scriptCodeCount >= MAX_SCRIPT_INSTRUCTIONS) return scriptCompileFail(sourceLine, "more than 768 commands");
+    if (scriptCodeCount >= MAX_SCRIPT_INSTRUCTIONS) return scriptCompileFail(sourceLine, "more than 4096 commands");
     const ScriptOp op = scriptOpFromName(fields[0]);
     if (op == SCRIPT_OP_INVALID || !scriptValidArity(op, count)) return scriptCompileFail(sourceLine, "unknown command or wrong number of fields");
     const uint16_t index = scriptCodeCount++;
-    scriptCode[index].sourceOffset = (uint16_t)(line - scriptProgram);
+    scriptCode[index].sourceOffset = (uint32_t)(line - scriptProgram);
     scriptCode[index].event = event;
     scriptCode[index].op = op;
     if (op == SCRIPT_OP_IF) {
-      if (depth >= 8) return scriptCompileFail(sourceLine, "if nesting exceeds 8 levels");
+      if (depth >= MAX_SCRIPT_NESTING) return scriptCompileFail(sourceLine, "control nesting exceeds 16 levels");
       stack[depth++] = {index, -1, event, SCRIPT_OP_IF};
     } else if (op == SCRIPT_OP_ELSE) {
       if (depth == 0 || stack[depth - 1].event != event || stack[depth - 1].type != SCRIPT_OP_IF || stack[depth - 1].elseInstruction >= 0) return scriptCompileFail(sourceLine, "else without matching if");
@@ -1164,7 +1531,7 @@ static bool compileScript(const char *source, size_t length) {
       if (frame.elseInstruction >= 0) scriptCode[frame.elseInstruction].jump = index + 1;
       else scriptCode[frame.instruction].jump = index + 1;
     } else if (op == SCRIPT_OP_REPEAT) {
-      if (depth >= 8) return scriptCompileFail(sourceLine, "control nesting exceeds 8 levels");
+      if (depth >= MAX_SCRIPT_NESTING) return scriptCompileFail(sourceLine, "control nesting exceeds 16 levels");
       stack[depth++] = {index, -1, event, SCRIPT_OP_REPEAT};
     } else if (op == SCRIPT_OP_ENDREPEAT) {
       if (depth == 0 || stack[depth - 1].event != event || stack[depth - 1].type != SCRIPT_OP_REPEAT) return scriptCompileFail(sourceLine, "endrepeat without matching repeat");
@@ -1278,7 +1645,32 @@ static void drawScriptEntity(uint8_t id) {
   ScriptEntity &entity = scriptEntities[id];
   if (!entity.active) return;
   if (!entity.visible) { hideEntity(id); return; }
-  makeEntity(id, (int)entity.x, (int)entity.y, entity.w, entity.h, entity.tint, entity.radius);
+  if (entity.isImage && entity.bitmapIndex < bitmapAssetCount && bitmapAssets[entity.bitmapIndex].loaded) {
+    BitmapAsset &bitmap = bitmapAssets[entity.bitmapIndex];
+    if (!entity.object || !entity.imageObject) {
+      if (entity.object) lv_obj_del(entity.object);
+      entity.object = lv_img_create(gameStage);
+      entity.imageObject = true;
+      entities[id] = entity.object;
+      lv_obj_set_style_bg_opa(entity.object, LV_OPA_TRANSP, 0);
+      lv_img_set_pivot(entity.object, 0, 0);
+      lv_img_set_antialias(entity.object, true);
+    }
+    lv_img_set_src(entity.object, &bitmap.image);
+    lv_img_set_zoom(entity.object, entity.zoom);
+    lv_obj_set_pos(entity.object, (int)entity.x, (int)entity.y);
+    lv_obj_set_style_opa(entity.object, entity.opacity, 0);
+    lv_obj_clear_flag(entity.object, LV_OBJ_FLAG_HIDDEN);
+    return;
+  }
+  if (entity.object && entity.imageObject) {
+    lv_obj_del(entity.object);
+    entity.object = nullptr;
+    entity.imageObject = false;
+    entities[id] = nullptr;
+  }
+  entity.object = makeEntity(id, (int)entity.x, (int)entity.y, entity.w, entity.h, entity.tint, entity.radius);
+  if (entity.object) lv_obj_set_style_opa(entity.object, entity.opacity, 0);
 }
 
 static bool scriptCollides(uint8_t first, uint8_t second) {
@@ -1347,7 +1739,7 @@ static void scriptExpandText(const char *input, char *output, size_t capacity) {
 
 static void scriptSetLabel(uint8_t id, int x, int y, int width, uint32_t tint, const char *text) {
   if (id >= MAX_SCRIPT_LABELS || !gameStage) return;
-  char expanded[128];
+  char expanded[385];
   scriptExpandText(text, expanded, sizeof(expanded));
   if (!scriptLabels[id]) {
     scriptLabels[id] = lv_label_create(gameStage);
@@ -1361,10 +1753,19 @@ static void scriptSetLabel(uint8_t id, int x, int y, int width, uint32_t tint, c
 
 static void resetScriptRuntime() {
   memset(scriptVariables, 0, sizeof(scriptVariables));
-  memset(scriptEntities, 0, sizeof(scriptEntities));
   scriptLevel = 1;
   scriptStartedAt = millis();
-  for (uint8_t i = 0; i < MAX_SCRIPT_ENTITIES; ++i) hideEntity(i);
+  for (uint8_t i = 0; i < MAX_SCRIPT_ENTITIES; ++i) {
+    ScriptEntity &entity = scriptEntities[i];
+    entity.x = entity.y = entity.vx = entity.vy = 0;
+    entity.w = entity.h = 0;
+    entity.active = entity.visible = entity.wrap = entity.tweening = entity.isImage = false;
+    entity.radius = 0;
+    entity.opacity = LV_OPA_COVER;
+    entity.zoom = 256;
+    entity.bitmapIndex = 0;
+    hideEntity(i);
+  }
   for (uint8_t i = 0; i < MAX_SCRIPT_LABELS; ++i) {
     if (scriptLabels[i]) lv_label_set_text(scriptLabels[i], "");
   }
@@ -1373,10 +1774,10 @@ static void resetScriptRuntime() {
 static void runScriptEvent(ScriptEvent event) {
   if (scriptCodeCount == 0 || event == SCRIPT_NO_EVENT) return;
   struct LoopFrame { uint16_t begin; uint16_t end; uint8_t remaining; };
-  LoopFrame loops[8];
+  LoopFrame loops[MAX_SCRIPT_NESTING];
   uint8_t loopDepth = 0;
-  char line[224];
-  char *fields[10];
+  char line[388];
+  char *fields[16];
   for (uint16_t pc = 0, budget = 0; pc < scriptCodeCount && budget < MAX_SCRIPT_EVENT_STEPS; ++pc) {
     const ScriptInstruction &instruction = scriptCode[pc];
     if (instruction.event != event) continue;
@@ -1384,7 +1785,7 @@ static void runScriptEvent(ScriptEvent event) {
     if (screenMode == SCREEN_PLAY && gameOver && event != SCRIPT_START) break;
     strncpy(line, scriptProgram + instruction.sourceOffset, sizeof(line) - 1);
     line[sizeof(line) - 1] = '\0';
-    const uint8_t count = scriptFields(line, fields, 10);
+    const uint8_t count = scriptFields(line, fields, 16);
     const ScriptOp op = (ScriptOp)instruction.op;
     auto value = [&](uint8_t index) -> int32_t { return index < count ? scriptValue(fields[index]) : 0; };
     switch (op) {
@@ -1401,7 +1802,7 @@ static void runScriptEvent(ScriptEvent event) {
         const uint8_t repetitions = (uint8_t)constrain(value(1), 0, (int)MAX_SCRIPT_REPEAT);
         if (repetitions == 0) {
           if (instruction.jump > pc) pc = instruction.jump - 1;
-        } else if (loopDepth < 8 && instruction.jump > 0) {
+        } else if (loopDepth < MAX_SCRIPT_NESTING && instruction.jump > 0) {
           loops[loopDepth++] = {pc, (uint16_t)(instruction.jump - 1), repetitions};
         }
         break;
@@ -1434,6 +1835,61 @@ static void runScriptEvent(ScriptEvent event) {
         entity.h = (int16_t)constrain(value(5), 1, 184);
         entity.tint = scriptColor(fields[6]);
         entity.radius = (uint8_t)constrain(value(7), 0, 24);
+        entity.isImage = false;
+        entity.active = entity.visible = true;
+        drawScriptEntity((uint8_t)id);
+        break;
+      }
+      case SCRIPT_OP_CIRCLE: {
+        const int id = value(1);
+        if (id < 0 || id >= MAX_SCRIPT_ENTITIES) break;
+        ScriptEntity &entity = scriptEntities[id];
+        const int diameter = constrain(value(4), 1, 184);
+        entity.x = constrain(value(2), -448, 896);
+        entity.y = constrain(value(3), -184, 368);
+        entity.w = entity.h = diameter;
+        entity.tint = scriptColor(fields[5]);
+        entity.radius = diameter / 2;
+        entity.isImage = false;
+        entity.active = entity.visible = true;
+        drawScriptEntity((uint8_t)id);
+        break;
+      }
+      case SCRIPT_OP_BACKGROUND:
+        if (gameStage) {
+          lv_obj_set_style_bg_color(gameStage, color(scriptColor(fields[1])), 0);
+          lv_obj_set_style_bg_opa(gameStage, LV_OPA_COVER, 0);
+        }
+        break;
+      case SCRIPT_OP_ALPHA: {
+        const int id = value(1);
+        if (id >= 0 && id < MAX_SCRIPT_ENTITIES && scriptEntities[id].active) {
+          scriptEntities[id].opacity = (uint8_t)constrain(value(2), 0, 255);
+          drawScriptEntity((uint8_t)id);
+        }
+        break;
+      }
+      case SCRIPT_OP_IMAGE: {
+        const int id = value(1);
+        if (id < 0 || id >= MAX_SCRIPT_ENTITIES) break;
+        int assetIndex = -1;
+        for (uint8_t i = 0; i < bitmapAssetCount; ++i) {
+          if (bitmapAssets[i].loaded && !strcasecmp(bitmapAssets[i].name, fields[2])) {
+            assetIndex = i;
+            break;
+          }
+        }
+        if (assetIndex < 0) break;
+        ScriptEntity &entity = scriptEntities[id];
+        BitmapAsset &bitmap = bitmapAssets[assetIndex];
+        const uint16_t percent = (uint16_t)constrain(value(5), 25, 400);
+        entity.bitmapIndex = (uint8_t)assetIndex;
+        entity.zoom = (uint16_t)(percent * 256U / 100U);
+        entity.x = constrain(value(3), -448, 896);
+        entity.y = constrain(value(4), -184, 368);
+        entity.w = max(1, (int)bitmap.width * percent / 100);
+        entity.h = max(1, (int)bitmap.height * percent / 100);
+        entity.isImage = true;
         entity.active = entity.visible = true;
         drawScriptEntity((uint8_t)id);
         break;
@@ -1512,11 +1968,25 @@ static void runScriptEvent(ScriptEvent event) {
       case SCRIPT_OP_TEXT: {
         const int id = value(1);
         if (id >= 0 && id < MAX_SCRIPT_LABELS && scriptLabels[id]) {
-          char expanded[128]; scriptExpandText(fields[2], expanded, sizeof(expanded));
+          char expanded[385]; scriptExpandText(fields[2], expanded, sizeof(expanded));
           lv_label_set_text(scriptLabels[id], expanded);
         }
         break;
       }
+      case SCRIPT_OP_MUSIC:
+        playGameAudio(fields[1], count == 2 || !strcasecmp(fields[2], "loop"), consoleVolume);
+        break;
+      case SCRIPT_OP_SFX:
+        playGameAudio(fields[1], false, (uint8_t)constrain(value(2), 0, 21), true);
+        break;
+      case SCRIPT_OP_AUDIO_STOP:
+        stopGameAudio();
+        break;
+      case SCRIPT_OP_AUDIO_VOLUME:
+        consoleVolume = (uint8_t)constrain(value(1), 0, 21);
+        backgroundAudioVolume = consoleVolume;
+        if (audioReady) audio.setVolume(consoleVolume);
+        break;
       case SCRIPT_OP_CLEARLABEL: {
         const int id = value(1);
         if (id >= 0 && id < MAX_SCRIPT_LABELS && scriptLabels[id]) lv_label_set_text(scriptLabels[id], "");
@@ -1591,6 +2061,62 @@ static bool getGithubText(const String &url, String &body, size_t limit) {
   return body.length() > 0;
 }
 
+static bool downloadGithubAsset(const String &url, const String &path, size_t limit) {
+  WiFiClientSecure secureClient;
+  secureClient.setInsecure();
+  HTTPClient http;
+  http.setTimeout(12000);
+  http.setConnectTimeout(12000);
+  http.setUserAgent("PixelDeck-FNK0104N/3.0");
+  if (!http.begin(secureClient, url)) return false;
+  const int status = http.GET();
+  if (status != HTTP_CODE_OK) {
+    Serial.printf("[STORE] Asset HTTP status %d for %s\n", status, url.c_str());
+    http.end();
+    return false;
+  }
+  const int contentLength = http.getSize();
+  if (contentLength <= 0 || (size_t)contentLength > limit) {
+    http.end();
+    return false;
+  }
+  File output = SD_MMC.open(path, FILE_WRITE);
+  if (!output) {
+    http.end();
+    return false;
+  }
+  Stream *stream = http.getStreamPtr();
+  uint8_t chunk[1024];
+  size_t total = 0;
+  uint32_t lastProgress = millis();
+  bool ok = true;
+  while (stream && total < (size_t)contentLength) {
+    const int available = stream->available();
+    if (available <= 0) {
+      if (millis() - lastProgress > 12000) { ok = false; break; }
+      delay(1);
+      continue;
+    }
+    const size_t wanted = min(sizeof(chunk), min((size_t)available, (size_t)contentLength - total));
+    const size_t received = stream->readBytes(chunk, wanted);
+    if (!received || total + received > limit || output.write(chunk, received) != received) {
+      ok = false;
+      break;
+    }
+    total += received;
+    lastProgress = millis();
+    lv_timer_handler();
+    delay(1);
+  }
+  output.close();
+  http.end();
+  if (!ok || total != (size_t)contentLength) {
+    SD_MMC.remove(path);
+    return false;
+  }
+  return true;
+}
+
 static bool parseCart(const String &payload, GameCard &card) {
   scriptCompileErrorLine = 0;
   if (payload.length() == 0 || payload.length() > MAX_CART_BYTES) return false;
@@ -1624,11 +2150,23 @@ static bool parseCart(const String &payload, GameCard &card) {
     else if (key == "tick_ms") tickMs = constrain(value.toInt(), 20, 250);
     else if (key == "api") api = value.toInt();
     else if (key == "accent") accent = strtoul(value.c_str(), nullptr, 16) & 0xFFFFFF;
+    else if (key.startsWith("asset.")) {
+      const String assetName = key.substring(6);
+      if (!validAssetName(assetName) || !validAssetFilename(value) || card.assetCount >= MAX_GAME_ASSETS) return false;
+      for (uint8_t i = 0; i < card.assetCount; ++i) {
+        if (!strcasecmp(card.assets[i].name, assetName.c_str()) ||
+            !strcasecmp(card.assets[i].filename, value.c_str())) return false;
+      }
+      GameAssetDef &asset = card.assets[card.assetCount++];
+      copyText(asset.name, sizeof(asset.name), assetName);
+      copyText(asset.filename, sizeof(asset.filename), value);
+    }
   }
   const GameType gameType = parseGameType(type);
   if (!validId(id) || title.length() == 0 || gameType == GAME_NONE) return false;
+  if (card.assetCount && gameType != GAME_SCRIPT) return false;
   if (gameType == GAME_SCRIPT) {
-    if (api != 2 || codeStart < 0 || (size_t)codeStart >= payload.length()) return false;
+    if ((api != 2 && api != 3) || codeStart < 0 || (size_t)codeStart >= payload.length()) return false;
     const char *source = payload.c_str() + codeStart;
     const size_t codeLength = payload.length() - codeStart;
     if (!compileScript(source, codeLength)) return false;
@@ -1713,6 +2251,29 @@ static bool loadStoreCatalog() {
   return true;
 }
 
+static bool clearFlatDirectory(const String &path) {
+  File directory = SD_MMC.open(path);
+  if (!directory) return true;
+  if (!directory.isDirectory()) { directory.close(); return false; }
+  File entry = directory.openNextFile();
+  while (entry) {
+    String child = entry.name();
+    const bool isDirectory = entry.isDirectory();
+    entry.close();
+    if (!child.startsWith("/")) child = path + "/" + child;
+    if (isDirectory) {
+      if (!clearFlatDirectory(child)) { directory.close(); return false; }
+      SD_MMC.rmdir(child);
+    } else if (!SD_MMC.remove(child)) {
+      directory.close();
+      return false;
+    }
+    entry = directory.openNextFile();
+  }
+  directory.close();
+  return SD_MMC.rmdir(path);
+}
+
 static void installStoreItem(lv_event_t *event) {
   if (lv_event_get_code(event) != LV_EVENT_CLICKED) return;
   StoreItem *item = (StoreItem *)lv_event_get_user_data(event);
@@ -1746,17 +2307,68 @@ static void installStoreItem(lv_event_t *event) {
       downloaded.type != item->game.type) {
     if (storeStatus) {
       char message[80];
-      if (scriptCompileErrorLine) snprintf(message, sizeof(message), "API 2 ERROR ON LINE %u. CART NOT SAVED.", (unsigned)scriptCompileErrorLine);
+      if (scriptCompileErrorLine) snprintf(message, sizeof(message), "SCRIPT ERROR ON LINE %u. CART NOT SAVED.", (unsigned)scriptCompileErrorLine);
       else copyLiteral(message, sizeof(message), "Cart validation failed. Nothing was saved.");
       lv_label_set_text(storeStatus, message);
     }
     return;
   }
 
+  String assetDirectory, stagedAssets, assetBackup;
+  bool assetDirectoryHadPrevious = false;
+  bool stagedAssetsReady = false;
+  if (downloaded.assetCount > 0) {
+    const String gameDirectory = String(GAMES_DIR) + "/" + downloaded.id;
+    assetDirectory = gameDirectory + "/assets";
+    stagedAssets = gameDirectory + "/assets_stage";
+    assetBackup = gameDirectory + "/assets_backup";
+    SD_MMC.mkdir(gameDirectory);
+    if (SD_MMC.exists(stagedAssets) && !clearFlatDirectory(stagedAssets)) {
+      if (storeStatus) lv_label_set_text(storeStatus, "Could not prepare the asset staging folder.");
+      return;
+    }
+    if (!SD_MMC.mkdir(stagedAssets) && !SD_MMC.exists(stagedAssets)) {
+      if (storeStatus) lv_label_set_text(storeStatus, "Could not create the asset folder on SD.");
+      return;
+    }
+    size_t totalAssetBytes = 0;
+    bool assetsOk = true;
+    for (uint8_t i = 0; i < downloaded.assetCount; ++i) {
+      const GameAssetDef &asset = downloaded.assets[i];
+      const String assetUrl = root + "games/" + downloaded.id + "/assets/" + asset.filename;
+      const String stagedPath = stagedAssets + "/" + asset.filename;
+      if (storeStatus) {
+        char message[72];
+        snprintf(message, sizeof(message), "DOWNLOADING ASSET %u OF %u...", (unsigned)(i + 1), (unsigned)downloaded.assetCount);
+        lv_label_set_text(storeStatus, message);
+        lv_refr_now(nullptr);
+      }
+      if (!downloadGithubAsset(assetUrl, stagedPath, MAX_ASSET_BYTES)) {
+        assetsOk = false;
+        break;
+      }
+      File savedAsset = SD_MMC.open(stagedPath, FILE_READ);
+      const size_t assetSize = savedAsset ? savedAsset.size() : 0;
+      if (savedAsset) savedAsset.close();
+      if (assetSize == 0 || totalAssetBytes + assetSize > MAX_TOTAL_ASSET_BYTES) {
+        assetsOk = false;
+        break;
+      }
+      totalAssetBytes += assetSize;
+    }
+    if (!assetsOk) {
+      clearFlatDirectory(stagedAssets);
+      if (storeStatus) lv_label_set_text(storeStatus, "Asset download failed or exceeded the 2 MB game limit.");
+      return;
+    }
+    stagedAssetsReady = true;
+  }
+
   const String target = String(GAMES_DIR) + "/" + downloaded.id + ".cart";
   const String temporary = target + ".tmp";
   File file = SD_MMC.open(temporary, FILE_WRITE);
   if (!file) {
+    if (stagedAssetsReady) clearFlatDirectory(stagedAssets);
     if (storeStatus) lv_label_set_text(storeStatus, "Could not open the SD card for writing.");
     return;
   }
@@ -1764,24 +2376,56 @@ static void installStoreItem(lv_event_t *event) {
   file.close();
   if (written != payload.length()) {
     SD_MMC.remove(temporary);
+    if (stagedAssetsReady) clearFlatDirectory(stagedAssets);
     if (storeStatus) lv_label_set_text(storeStatus, "SD write was incomplete; the partial file was removed.");
     return;
+  }
+  if (stagedAssetsReady) {
+    if (SD_MMC.exists(assetBackup) && !clearFlatDirectory(assetBackup)) {
+      SD_MMC.remove(temporary);
+      clearFlatDirectory(stagedAssets);
+      if (storeStatus) lv_label_set_text(storeStatus, "Could not clean the previous asset backup.");
+      return;
+    }
+    assetDirectoryHadPrevious = SD_MMC.exists(assetDirectory);
+    if (assetDirectoryHadPrevious && !SD_MMC.rename(assetDirectory, assetBackup)) {
+      SD_MMC.remove(temporary);
+      clearFlatDirectory(stagedAssets);
+      if (storeStatus) lv_label_set_text(storeStatus, "Could not safely replace the old game assets.");
+      return;
+    }
+    if (!SD_MMC.rename(stagedAssets, assetDirectory)) {
+      if (assetDirectoryHadPrevious) SD_MMC.rename(assetBackup, assetDirectory);
+      SD_MMC.remove(temporary);
+      clearFlatDirectory(stagedAssets);
+      if (storeStatus) lv_label_set_text(storeStatus, "Could not activate the downloaded assets.");
+      return;
+    }
   }
   const String backup = target + ".bak";
   const bool hadPreviousCart = SD_MMC.exists(target);
   SD_MMC.remove(backup);
   if (hadPreviousCart && !SD_MMC.rename(target, backup)) {
     SD_MMC.remove(temporary);
+    if (stagedAssetsReady) {
+      clearFlatDirectory(assetDirectory);
+      if (assetDirectoryHadPrevious) SD_MMC.rename(assetBackup, assetDirectory);
+    }
     if (storeStatus) lv_label_set_text(storeStatus, "Could not safely replace the existing cart.");
     return;
   }
   if (!SD_MMC.rename(temporary, target)) {
     SD_MMC.remove(temporary);
     if (hadPreviousCart) SD_MMC.rename(backup, target);
+    if (stagedAssetsReady) {
+      clearFlatDirectory(assetDirectory);
+      if (assetDirectoryHadPrevious) SD_MMC.rename(assetBackup, assetDirectory);
+    }
     if (storeStatus) lv_label_set_text(storeStatus, "Could not finish saving the cart to SD.");
     return;
   }
   SD_MMC.remove(backup);
+  if (stagedAssetsReady && assetDirectoryHadPrevious) clearFlatDirectory(assetBackup);
 
   addGame(downloaded);
   item->installed = true;
@@ -1865,12 +2509,12 @@ static void showHelp() {
   makeLabel(lv_scr_act(), "CONTROLS", 22, 58, 140, 24, C_CYAN, &lv_font_montserrat_20);
   makeLabel(lv_scr_act(), "<  >  move left / right     ^  v  move up / down     A / B  game actions",
             22, 91, 436, 32, C_WHITE);
-  makeLabel(lv_scr_act(), "Script API games can define their own rules, levels, collisions, moving shapes, labels, and A/B actions.",
+  makeLabel(lv_scr_act(), "Script API 3: original rules, up to 160 entities, custom bitmap sprites, sound, physics, collisions, and A/B actions.",
             22, 130, 436, 42, C_MUTED);
   makeLabel(lv_scr_act(), "STORE SETUP", 22, 182, 180, 24, C_MAGENTA, &lv_font_montserrat_20);
-  makeLabel(lv_scr_act(), "Connect to a 2.4 GHz Wi-Fi network in Settings. Publish the included store folder at the root of a public GitHub repository, then save its raw URL ending in /main/ (or your branch) in Settings.",
+  makeLabel(lv_scr_act(), "Connect to 2.4 GHz Wi-Fi. Publish catalog.txt, games/<id>.cart, and each game's games/<id>/assets/ files in a public GitHub repo. Set its raw URL in Settings.",
             22, 215, 436, 53, C_WHITE);
-  makeLabel(lv_scr_act(), "Downloaded carts are text data saved to /ARCADE/GAMES on microSD. Built-in games and high scores work without a card.",
+  makeLabel(lv_scr_act(), "The SD card stores downloaded games, sprites, and audio. Built-in games and high scores work without a card.",
             22, 275, 436, 34, C_MUTED);
 }
 
@@ -2039,6 +2683,7 @@ void setup() {
   randomSeed(esp_random());
   beginDisplay();
   mountStorage();
+  audioReady = beginAudio();
   addBuiltIn("snake", "POCKET SNAKE", "Collect the signal. Avoid your own trail.", GAME_SNAKE, 12, C_CYAN);
   addBuiltIn("pong", "VECTOR PONG", "A neon rally against the cabinet.", GAME_PONG, 10, C_MAGENTA);
   addBuiltIn("breakout", "BRICK BREAKER", "Clear four rows and keep the ball alive.", GAME_BREAKOUT, 9, C_AMBER);
@@ -2049,6 +2694,13 @@ void setup() {
 }
 
 void loop() {
+  if (audioReady) {
+    audio.loop();
+    if (effectAudioActive && !audio.isRunning()) {
+      effectAudioActive = false;
+      if (backgroundAudioName[0] && backgroundAudioLoops) playGameAudio(backgroundAudioName, true, backgroundAudioVolume);
+    }
+  }
   const uint32_t now = millis();
   if (now - lastLvTick >= 5) {
     lv_tick_inc(now - lastLvTick);
