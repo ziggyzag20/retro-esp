@@ -24,3 +24,8 @@ The Retro-ESP is a handheld touchscreen retro game device that you can use anywh
 3. Upload the code. If any errors present themselves, recheck everything and report as a bug if necessary.
 4. Before booting, copy the library to the SD card and insert it. If you insert after booting, restart the microcontroller by pressing the RESET button or simply unplug your power source.
 5. Test for any issues. If issues occur, check everything again and report as a bug if necessary.
+
+<ins>Installing games:</ins>
+To install any games, you can simply use the game store function to download any games over Wi-Fi to the SD card. Playing them is as simple as opening them.
+
+Should any issues arise, you should report it as a bug on the branch for that game. Please do not contact me for support if I did not make the game.
