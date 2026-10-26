@@ -1,6 +1,0 @@
-# id|title|type|speed|accent|description
-ghost-byte|GHOST BYTE|SNAKE|15|56E5FF|Chase the signal through a faster neon maze.
-vector-duel|VECTOR DUEL|PONG|12|F356B8|A quicker rally with a hot magenta cabinet.
-neon-bricks|NEON BRICKS|BREAKOUT|12|FFC857|A rapid-fire brick wall with amber highlights.
-star-patrol|STAR PATROL|INVADERS|14|B9F66A|A faster alien wave in the green sector.
-orbit-courier|ORBIT COURIER|SCRIPT|8|56E5FF|A fully custom dodge game built with PixelDeck Script API 2.

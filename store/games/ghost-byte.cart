@@ -1,7 +1,0 @@
-# PixelDeck cartridge data. This file is not executable.
-id=ghost-byte
-title=GHOST BYTE
-type=SNAKE
-speed=15
-accent=56E5FF
-description=Chase the signal through a faster neon maze.

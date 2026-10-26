@@ -1,7 +1,0 @@
-# PixelDeck cartridge data. This file is not executable.
-id=neon-bricks
-title=NEON BRICKS
-type=BREAKOUT
-speed=12
-accent=FFC857
-description=A rapid-fire brick wall with amber highlights.

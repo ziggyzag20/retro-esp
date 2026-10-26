@@ -1,7 +1,0 @@
-# PixelDeck cartridge data. This file is not executable.
-id=star-patrol
-title=STAR PATROL
-type=INVADERS
-speed=14
-accent=B9F66A
-description=A faster alien wave in the green sector.
