@@ -32,7 +32,7 @@ static const uint16_t SD_D0_PIN = 6;
 static const uint16_t SD_D1_PIN = 7;
 static const uint16_t SD_D2_PIN = 2;
 static const uint16_t SD_D3_PIN = 3;
-static const char *STORE_ROOT_DEFAULT = "https://raw.githubusercontent.com/owner/PixelDeck-Store/main/";
+static const char *STORE_ROOT_DEFAULT = "https://raw.githubusercontent.com/ziggyzag20/retro-esp/main/";
 static const char *GAMES_DIR = "/ARCADE/GAMES";
 static const uint8_t MAX_GAMES = 32;
 static const uint8_t MAX_STORE_ITEMS = 24;
@@ -203,7 +203,6 @@ static bool gameOver = false;
 static bool shotActive = false;
 static uint32_t score = 0;
 static uint32_t bestScore = 0;
-static uint32_t lastLvTick = 0;
 static uint32_t lastGameTick = 0;
 static uint32_t lastStatusTick = 0;
 static uint32_t lastStarTick = 0;
@@ -1614,7 +1613,7 @@ static void scriptSetValue(const char *name, int32_t value) {
   while (name && *name == '$') ++name;
   if (!name || !*name) return;
   if (!strcasecmp(name, "score")) {
-    score = (uint32_t)max(0, value);
+    score = value > 0 ? (uint32_t)value : 0;
     updateGameScoreText();
     return;
   }
@@ -2690,7 +2689,7 @@ void setup() {
   addBuiltIn("invaders", "ASTRO RAIDERS", "Hold the line and clear the alien wave.", GAME_INVADERS, 11, C_LIME);
   beginWiFi();
   showHome();
-  lastLvTick = lastStatusTick = millis();
+  lastStatusTick = millis();
 }
 
 void loop() {
@@ -2702,10 +2701,6 @@ void loop() {
     }
   }
   const uint32_t now = millis();
-  if (now - lastLvTick >= 5) {
-    lv_tick_inc(now - lastLvTick);
-    lastLvTick = now;
-  }
   if (wifiAttemptActive) {
     if (WiFi.status() == WL_CONNECTED) {
       wifiAttemptActive = false;
