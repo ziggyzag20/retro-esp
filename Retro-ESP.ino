@@ -1,5 +1,5 @@
 /*
-  PIXELDECK / FNK0104N
+  RETRO-ESP / FNK0104N
   A landscape LVGL arcade console for the Freenove FNK0104N.
 
   Built-in games are native firmware. The public store also loads bounded,
@@ -293,7 +293,11 @@ static bool configureEs8311() {
 static bool beginAudio() {
   pinMode(AUDIO_AMP_ENABLE_PIN, OUTPUT);
   digitalWrite(AUDIO_AMP_ENABLE_PIN, LOW);
-  Wire.begin(AUDIO_I2C_SDA_PIN, AUDIO_I2C_SCL_PIN, 400000);
+  // ST77922_TOUCH owns the shared Wire bus and initializes it on GPIO 38/39
+  // at 100 kHz. Re-running Wire.begin() here reconfigures the touch bus after
+  // the controller has started and can leave touch reads failing. The ES8311
+  // also works on this 100 kHz bus, so keep the controller's bus configuration.
+  Wire.setClock(100000);
   es8311_i2s.setPins(I2S_BCLK_PIN, I2S_WS_PIN, I2S_DOUT_PIN, I2S_DIN_PIN, I2S_MCLK_PIN);
   if (!es8311_i2s.begin(I2S_MODE_STD, 44100, I2S_DATA_BIT_WIDTH_16BIT,
                        I2S_SLOT_MODE_STEREO, I2S_STD_SLOT_LEFT)) {
@@ -834,6 +838,9 @@ static void drawFlush(lv_disp_drv_t *driver, const lv_area_t *area, lv_color_t *
 }
 
 static void readTouch(lv_indev_drv_t *, lv_indev_data_t *data) {
+  // LVGL uses the last pointer position on release to finish click handling.
+  data->point.x = pointerX;
+  data->point.y = pointerY;
   data->state = LV_INDEV_STATE_REL;
   if (!touch || touch->max_points == 0) return;
   uint8_t activePoints = 0;
@@ -849,7 +856,10 @@ static void readTouch(lv_indev_drv_t *, lv_indev_data_t *data) {
   touch->Get_Touch();
   const uint16_t x = touch->touch.x[0];
   const uint16_t y = touch->touch.y[0];
-  if (x >= SCREEN_W || y >= SCREEN_H) { pointerDown = false; return; }
+  if (x >= SCREEN_W || y >= SCREEN_H) {
+    pointerDown = false;
+    return;
+  }
   pointerX = (int16_t)x;
   pointerY = (int16_t)y;
   pointerDown = true;
@@ -2654,6 +2664,7 @@ static void beginDisplay() {
   touch = new ST77922_TOUCH();
   touch->init();
   touch->Set_Rotation(1);
+  Serial.printf("[TOUCH] Controller initialized; max points: %u\n", touch->max_points);
 
   lv_init();
   lv_disp_draw_buf_init(&displayDrawBuffer, displayBuffer, nullptr, SCREEN_W * 20);
